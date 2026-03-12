@@ -203,7 +203,8 @@ class WatchedService {
         imdbId: string,
         watchedAt: Date = new Date(),
         malId?: number,
-        tmdbId?: number
+        tmdbId?: number,
+        title?: string
     ): Promise<{ success: boolean; syncedToTrakt: boolean }> {
         try {
             logger.log(`[WatchedService] Marking movie as watched: ${imdbId}`);
@@ -221,7 +222,7 @@ class WatchedService {
             const malToken = MalAuth.getToken();
             if (malToken) {
                 MalSync.scrobbleEpisode(
-                    '', // Don't use IMDb ID as title fallback (unlikely to match)
+                    title || '', // Use real title if provided for search fallback
                     1, 
                     1, 
                     'movie', 

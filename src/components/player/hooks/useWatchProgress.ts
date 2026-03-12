@@ -189,7 +189,7 @@ export const useWatchProgress = (
                             currentTmdbId
                         );
                     } else if (type === 'movie' && currentImdbId) {
-                        watchedService.markMovieAsWatched(currentImdbId, new Date(), currentMalId, currentTmdbId);
+                        watchedService.markMovieAsWatched(currentImdbId, new Date(), currentMalId, currentTmdbId, title);
                     }
                 }
             } catch (error) {

@@ -375,28 +375,31 @@ export const MalSync = {
           const currentLibrary = await catalogService.getLibraryItems();
           const libraryIds = new Set(currentLibrary.map(l => l.id));
 
-          // Process items in parallel
-          await Promise.all(response.data.map(async (item) => {
-              const malId = item.node.id;
-              const { imdbId } = await MalSync.getIdsFromMalId(malId);
-              
-              if (imdbId && !libraryIds.has(imdbId)) {
-                  const type = item.node.media_type === 'movie' ? 'movie' : 'series';
-                  logger.log(`[MalSync] Auto-adding to library: ${item.node.title} (${imdbId})`);
+          // Process items in small batches to avoid rate limiting
+          for (let i = 0; i < response.data.length; i += 5) {
+              const batch = response.data.slice(i, i + 5);
+              await Promise.all(batch.map(async (item) => {
+                  const malId = item.node.id;
+                  const { imdbId } = await MalSync.getIdsFromMalId(malId);
                   
-                  await catalogService.addToLibrary({
-                      id: imdbId,
-                      type: type,
-                      name: item.node.title,
-                      poster: item.node.main_picture?.large || item.node.main_picture?.medium || '',
-                      posterShape: 'poster',
-                      year: item.node.start_season?.year,
-                      description: '',
-                      genres: [],
-                      inLibrary: true,
-                  });
-              }
-          }));
+                  if (imdbId && !libraryIds.has(imdbId)) {
+                      const type = item.node.media_type === 'movie' ? 'movie' : 'series';
+                      logger.log(`[MalSync] Auto-adding to library: ${item.node.title} (${imdbId})`);
+                      
+                      await catalogService.addToLibrary({
+                          id: imdbId,
+                          type: type,
+                          name: item.node.title,
+                          poster: item.node.main_picture?.large || item.node.main_picture?.medium || '',
+                          posterShape: 'poster',
+                          year: item.node.start_season?.year,
+                          description: '',
+                          genres: [],
+                          inLibrary: true,
+                      });
+                  }
+              }));
+          }
       } catch (e) {
           logger.error('[MalSync] syncMalWatchingToLibrary failed:', e);
       }
