@@ -31,6 +31,14 @@
       ],
       "versions": [
         {
+          "version": "1.4.2",
+          "buildVersion": "38",
+          "date": "2026-03-13",
+          "localizedDescription": "## Update Notes\n\n- Added **MyAnimeList (MAL) integration** with authentication, library sync, rewatch support, and profile dashboard\n- Improved **MAL mapping and sync performance**\n- Updated **authentication logic and UI**\n- Updated **trailer extraction logic**\n- Dependency updates and internal improvements\n\n### Contributors\n- **@paregi12**\n- **@saimuelbr**\n- **@vhtuan288**",
+          "downloadURL": "https://github.com/tapframe/NuvioStreaming/releases/download/1.4.2/Stable_1-4-2.ipa",
+          "size": 25700000
+        },
+        {
           "version": "1.4.1",
           "buildVersion": "37",
           "date": "2026-02-27",

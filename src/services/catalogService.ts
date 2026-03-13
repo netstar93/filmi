@@ -16,19 +16,28 @@ export enum DataSource {
   TMDB = 'tmdb',
 }
 
+interface StreamingCatalogExtra {
+  name: string;
+  isRequired?: boolean;
+  options?: string[];
+  optionsLimit?: number;
+}
+
+interface StreamingCatalog {
+  type: string;
+  id: string;
+  name: string;
+  extraSupported?: string[];
+  extra?: StreamingCatalogExtra[];
+}
+
 export interface StreamingAddon {
   id: string;
   name: string;
   version: string;
   description: string;
   types: string[];
-  catalogs: {
-    type: string;
-    id: string;
-    name: string;
-    extraSupported?: string[];
-    extra?: Array<{ name: string; options?: string[] }>;
-  }[];
+  catalogs: StreamingCatalog[];
   resources: {
     name: string;
     types: string[];
@@ -324,13 +333,47 @@ class CatalogService {
       version: manifest.version,
       description: manifest.description,
       types: manifest.types || [],
-      catalogs: manifest.catalogs || [],
+      catalogs: (manifest.catalogs || []).map(catalog => ({
+        ...catalog,
+        extraSupported: catalog.extraSupported || [],
+        extra: (catalog.extra || []).map(extra => ({
+          name: extra.name,
+          isRequired: extra.isRequired,
+          options: extra.options,
+          optionsLimit: extra.optionsLimit,
+        })),
+      })),
       resources: manifest.resources || [],
       url: (manifest.url || manifest.originalUrl) as any,
       originalUrl: (manifest.originalUrl || manifest.url) as any,
       transportUrl: manifest.url,
       transportName: manifest.name
     };
+  }
+
+  private catalogSupportsExtra(catalog: StreamingCatalog, extraName: string): boolean {
+    return (catalog.extraSupported || []).includes(extraName) ||
+      (catalog.extra || []).some(extra => extra.name === extraName);
+  }
+
+  private getRequiredCatalogExtras(catalog: StreamingCatalog): string[] {
+    return (catalog.extra || [])
+      .filter(extra => extra.isRequired)
+      .map(extra => extra.name);
+  }
+
+  private canBrowseCatalog(catalog: StreamingCatalog): boolean {
+    const requiredExtras = this.getRequiredCatalogExtras(catalog);
+    return requiredExtras.every(extraName => extraName === 'genre');
+  }
+
+  private canSearchCatalog(catalog: StreamingCatalog): boolean {
+    if (!this.catalogSupportsExtra(catalog, 'search')) {
+      return false;
+    }
+
+    const requiredExtras = this.getRequiredCatalogExtras(catalog);
+    return requiredExtras.every(extraName => extraName === 'search');
   }
 
   async resolveHomeCatalogsToFetch(limitIds?: string[]): Promise<{ addon: StreamingAddon; catalog: any }[]> {
@@ -346,6 +389,10 @@ class CatalogService {
     for (const addon of addons) {
       if (addon.catalogs) {
         for (const catalog of addon.catalogs) {
+          if (!this.canBrowseCatalog(catalog)) {
+            continue;
+          }
+
           const settingKey = `${addon.id}:${catalog.type}:${catalog.id}`;
           const isEnabled = catalogSettings[settingKey] ?? true;
 
@@ -1080,6 +1127,10 @@ class CatalogService {
       if (!addon.catalogs) continue;
 
       for (const catalog of addon.catalogs) {
+        if (!this.canBrowseCatalog(catalog)) {
+          continue;
+        }
+
         // Track content types
         if (catalog.type) {
           allTypes.add(catalog.type);
@@ -1145,7 +1196,9 @@ class CatalogService {
       if (!addon.catalogs) continue;
 
       // Find catalogs matching the type
-      const matchingCatalogs = addon.catalogs.filter(catalog => catalog.type === type);
+      const matchingCatalogs = addon.catalogs.filter(catalog =>
+        catalog.type === type && this.canBrowseCatalog(catalog)
+      );
 
       for (const catalog of matchingCatalogs) {
         // Check if this catalog supports the genre filter
@@ -1234,6 +1287,12 @@ class CatalogService {
         return [];
       }
 
+      const catalog = (manifest.catalogs || []).find(item => item.type === type && item.id === catalogId);
+      if (!catalog || !this.canBrowseCatalog(catalog)) {
+        logger.warn(`Catalog ${catalogId} in addon ${addonId} is not browseable`);
+        return [];
+      }
+
       const filters = genre ? [{ title: 'genre', value: genre }] : [];
       const metas = await stremioService.getCatalog(manifest, type, catalogId, page, filters);
 
@@ -1263,6 +1322,10 @@ class CatalogService {
     for (const addon of addons) {
       if (addon.catalogs && addon.catalogs.length > 0) {
         for (const catalog of addon.catalogs) {
+          if (!this.canSearchCatalog(catalog)) {
+            continue;
+          }
+
           const addonManifest = await stremioService.getInstalledAddonsAsync();
           const manifest = addonManifest.find(a => a.id === addon.id);
           if (!manifest) continue;
@@ -1327,15 +1390,7 @@ class CatalogService {
     const searchableAddons = addons.filter(addon => {
       if (!addon.catalogs) return false;
 
-      // Check if any catalog supports search
-      return addon.catalogs.some(catalog => {
-        const extraSupported = catalog.extraSupported || [];
-        const extra = catalog.extra || [];
-
-        // Check if 'search' is in extraSupported or extra
-        return extraSupported.includes('search') ||
-          extra.some((e: any) => e.name === 'search');
-      });
+      return addon.catalogs.some(catalog => this.canSearchCatalog(catalog));
     });
 
     logger.log(`Found ${searchableAddons.length} searchable addons:`, searchableAddons.map(a => a.name).join(', '));
@@ -1349,12 +1404,7 @@ class CatalogService {
         continue;
       }
 
-      const searchableCatalogs = (addon.catalogs || []).filter(catalog => {
-        const extraSupported = catalog.extraSupported || [];
-        const extra = catalog.extra || [];
-        return extraSupported.includes('search') ||
-          extra.some((e: any) => e.name === 'search');
-      });
+      const searchableCatalogs = (addon.catalogs || []).filter(catalog => this.canSearchCatalog(catalog));
 
       // Search all catalogs for this addon in parallel
       const catalogPromises = searchableCatalogs.map(catalog =>
@@ -1436,10 +1486,7 @@ class CatalogService {
 
       // Determine searchable addons
       const searchableAddons = addons.filter(addon =>
-        (addon.catalogs || []).some(c =>
-          (c.extraSupported && c.extraSupported.includes('search')) ||
-          (c.extra && c.extra.some(e => e.name === 'search'))
-        )
+        (addon.catalogs || []).some(catalog => this.canSearchCatalog(catalog))
       );
 
       logger.log(`Found ${searchableAddons.length} searchable addons:`, searchableAddons.map(a => `${a.name} (${a.id})`).join(', '));
@@ -1463,10 +1510,7 @@ class CatalogService {
               return;
             }
 
-            const searchableCatalogs = (addon.catalogs || []).filter(c =>
-              (c.extraSupported && c.extraSupported.includes('search')) ||
-              (c.extra && c.extra.some(e => e.name === 'search'))
-            );
+            const searchableCatalogs = (addon.catalogs || []).filter(catalog => this.canSearchCatalog(catalog));
 
             logger.log(`Searching ${addon.name} (${addon.id}) with ${searchableCatalogs.length} searchable catalogs`);
 
