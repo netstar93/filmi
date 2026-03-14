@@ -1924,13 +1924,16 @@ export const useMetadata = ({ id, type, addonId }: UseMetadataProps): UseMetadat
 
         const cleanEpisodeId = episodeId.replace(/^series:/, '');
         const parts = cleanEpisodeId.split(':');
+        // Check the episode ID's own namespace, not the show-level id.
+        // e.g. show id may be "tt12343534" but episodeId may be "kitsu:48363:8"
+        const episodeIsImdb = parts[0].startsWith('tt');
 
-        if (isImdb && parts.length === 3) {
+        if (episodeIsImdb && parts.length === 3) {
           // Format: ttXXX:season:episode
           showIdStr = parts[0];
           seasonNum = parts[1];
           episodeNum = parts[2];
-        } else if (!isImdb && parts.length === 3) {
+        } else if (!episodeIsImdb && parts.length === 3) {
           // Format: prefix:id:episode (no season for MAL/Kitsu/etc)
           showIdStr = `${parts[0]}:${parts[1]}`;
           episodeNum = parts[2];
