@@ -1782,11 +1782,8 @@ const LibraryScreen = () => {
           setFilter(filterType);
         }}
         activeOpacity={0.7}
-      >
-        {iconName && (
-          <MaterialIcons name={iconName} size={20} color={isActive ? currentTheme.colors.white : currentTheme.colors.mediumGray} style={styles.filterIcon} />
-        )}
-        <Text
+       >
+         <Text
           style={[
             styles.filterText,
             { color: currentTheme.colors.mediumGray },
@@ -1901,11 +1898,11 @@ const LibraryScreen = () => {
             style={styles.filtersContainer}
             contentContainerStyle={styles.filtersContent}
           >
-            {renderFilter('trakt', 'Trakt', 'pan-tool')}
-            {renderFilter('simkl', 'SIMKL', 'video-library')}
-            {renderFilter('mal', 'MAL', 'book')}
-            {renderFilter('movies', t('search.movies'), 'movie')}
-            {renderFilter('series', t('search.tv_shows'), 'live-tv')}
+           {renderFilter('trakt', 'Trakt')}
+           {renderFilter('simkl', 'SIMKL')}
+           {renderFilter('mal', 'MAL')}
+           {renderFilter('movies', t('search.movies'))}
+           {renderFilter('series', t('search.tv_shows'))}
           </ScrollView>
         )}
 

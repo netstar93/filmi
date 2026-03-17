@@ -57,6 +57,7 @@ import { TMDBService } from '../../services/tmdbService';
 import TrailerService, { TrailerPlaybackSource } from '../../services/trailerService';
 import TrailerPlayer from '../video/TrailerPlayer';
 import { HERO_HEIGHT, SCREEN_WIDTH as width, IS_TABLET as isTablet } from '../../constants/dimensions';
+import PlayerPlayIconBlack from '../../../assets/player-icons/ic_player_play_black.svg';
 
 const { height } = Dimensions.get('window');
 
@@ -355,16 +356,19 @@ const ActionButtons = memo(({
           onPress={handleShowStreams}
           activeOpacity={0.85}
         >
-          <MaterialIcons
-            name={(() => {
-              if (isWatched) {
-                return type === 'movie' ? 'replay' : 'play-arrow';
-              }
-              return playButtonText === 'Resume' ? 'play-circle-outline' : 'play-arrow';
-            })()}
-            size={isTablet ? 28 : 24}
-            color={isWatched && type === 'movie' ? "#fff" : "#000"}
-          />
+          {isWatched && type === 'movie' ? (
+            <MaterialIcons
+              name="replay"
+              size={isTablet ? 28 : 24}
+              color="#fff"
+            />
+          ) : (
+            <PlayerPlayIconBlack
+              width={isTablet ? 28 : 24}
+              height={isTablet ? 28 : 24}
+              style={{ transform: [{ scale: isTablet ? 0.85 : 0.79 }] }}
+            />
+          )}
           <Text style={[playButtonTextStyle, isTablet && styles.tabletPlayButtonText]}>{finalPlayButtonText}</Text>
         </TouchableOpacity>
 
