@@ -321,13 +321,9 @@ async function searchAddonCatalog(
 
     const items = metas.map(meta => {
       const content = convertMetaToStreamingContent(meta, library);
-      const addonSupportsMeta = Array.isArray(manifest.resources) && manifest.resources.some((resource: any) =>
-        resource === 'meta' || (typeof resource === 'object' && resource?.name === 'meta')
-      );
-
-      if (addonSupportsMeta) {
-        content.addonId = manifest.id;
-      }
+      // Do NOT set addonId from search results — let getMetaDetails resolve the correct
+      // meta addon by ID prefix matching. Setting it here causes 404s when two addons
+      // are installed and one returns IDs the other can't serve metadata for.
 
       const normalizedCatalogType = type ? type.toLowerCase() : type;
       if (normalizedCatalogType && content.type !== normalizedCatalogType) {

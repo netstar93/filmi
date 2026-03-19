@@ -38,11 +38,8 @@ export async function getContentDetails(
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
 
-        const isValidId = await stremioService.isValidContentId(type, id);
-
-        if (!isValidId) {
-          break;
-        }
+        // isValidContentId gate removed — getMetaDetails uses addonCanServeId()
+        // for per-addon prefix matching, avoiding false negatives for custom ID types.
         meta = await stremioService.getMetaDetails(type, id, preferredAddonId);
 
         if (meta) {
@@ -102,10 +99,8 @@ export async function getBasicContentDetails(
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
-        if (!(await stremioService.isValidContentId(type, id))) {
-          break;
-        }
-
+        // isValidContentId gate removed — getMetaDetails uses addonCanServeId()
+        // for per-addon prefix matching, avoiding false negatives for custom ID types.
         meta = await stremioService.getMetaDetails(type, id, preferredAddonId);
         if (meta) {
           break;

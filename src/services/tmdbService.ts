@@ -582,6 +582,32 @@ export class TMDBService {
   /**
    * Find TMDB ID by IMDB ID
    */
+  /**
+   * Resolve both the TMDB ID and the correct content type ('movie' | 'series') for an IMDb ID.
+   * Uses TMDB's /find endpoint which returns tv_results and movie_results simultaneously,
+   * giving a definitive type without sequential guessing.
+   * TV results take priority since "other"-typed search results are usually series/anime.
+   */
+  async findTypeAndIdByIMDB(imdbId: string): Promise<{ tmdbId: number; type: 'movie' | 'series' } | null> {
+    try {
+      const baseImdbId = imdbId.split(':')[0];
+      const response = await axios.get(`${BASE_URL}/find/${baseImdbId}`, {
+        headers: await this.getHeaders(),
+        params: await this.getParams({ external_source: 'imdb_id' }),
+      });
+
+      if (response.data.tv_results?.length > 0) {
+        return { tmdbId: response.data.tv_results[0].id, type: 'series' };
+      }
+      if (response.data.movie_results?.length > 0) {
+        return { tmdbId: response.data.movie_results[0].id, type: 'movie' };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   async findTMDBIdByIMDB(imdbId: string, language: string = 'en-US'): Promise<number | null> {
     const cacheKey = this.generateCacheKey('find_imdb', { imdbId, language });
 

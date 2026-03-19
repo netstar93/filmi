@@ -177,30 +177,49 @@ export function getCatalogHasMore(
   return ctx.catalogHasMore.get(`${manifestId}|${type}|${id}`);
 }
 
-function addonSupportsMetaResource(addon: Manifest, type: string, id: string): boolean {
-  let hasMetaSupport = false;
-  let supportsIdPrefix = false;
-
+/**
+ * Check if an addon can serve metadata for this ID by matching ID prefix.
+ * Does NOT require a type match — type is resolved separately via resolveTypeForAddon.
+ */
+function addonCanServeId(addon: Manifest, id: string): boolean {
   for (const resource of addon.resources || []) {
     if (typeof resource === 'object' && resource !== null && 'name' in resource) {
-      const typedResource = resource as ResourceObject;
-      if (typedResource.name === 'meta' && typedResource.types?.includes(type)) {
-        hasMetaSupport = true;
-        supportsIdPrefix =
-          !typedResource.idPrefixes?.length ||
-          typedResource.idPrefixes.some(prefix => id.startsWith(prefix));
-        break;
-      }
-    } else if (resource === 'meta' && addon.types?.includes(type)) {
-      hasMetaSupport = true;
-      supportsIdPrefix =
-        !addon.idPrefixes?.length || addon.idPrefixes.some(prefix => id.startsWith(prefix));
-      break;
+      const r = resource as ResourceObject;
+      if (r.name !== 'meta') continue;
+      if (!r.idPrefixes?.length) return true;
+      if (r.idPrefixes.some(p => id.startsWith(p))) return true;
+    } else if (resource === 'meta') {
+      if (!addon.idPrefixes?.length) return true;
+      if (addon.idPrefixes.some(p => id.startsWith(p))) return true;
     }
   }
+  return false;
+}
 
-  const requiresIdPrefix = !!addon.idPrefixes?.length;
-  return hasMetaSupport && (!requiresIdPrefix || supportsIdPrefix);
+/**
+ * Resolve the correct type to use in the metadata URL for a given addon.
+ * Looks at what types the addon declares for its meta resource matching this ID prefix,
+ * rather than blindly trusting the passed-in type (which may be "other", "Movie", etc.).
+ * Falls back to lowercased passed-in type if no better match found.
+ */
+function resolveTypeForAddon(addon: Manifest, type: string, id: string): string {
+  const lowerFallback = type ? type.toLowerCase() : type;
+  for (const resource of addon.resources || []) {
+    if (typeof resource === 'object' && resource !== null && 'name' in resource) {
+      const r = resource as ResourceObject;
+      if (r.name !== 'meta' || !r.types?.length) continue;
+      const prefixMatch = !r.idPrefixes?.length || r.idPrefixes.some(p => id.startsWith(p));
+      if (prefixMatch) {
+        const exact = r.types.find(t => t.toLowerCase() === lowerFallback);
+        return exact ?? r.types[0];
+      }
+    }
+  }
+  if (addon.types?.length) {
+    const exact = addon.types.find(t => t.toLowerCase() === lowerFallback);
+    return exact ?? addon.types[0];
+  }
+  return lowerFallback;
 }
 
 async function fetchMetaFromAddon(
@@ -209,11 +228,12 @@ async function fetchMetaFromAddon(
   type: string,
   id: string
 ): Promise<MetaDetails | null> {
+  const resolvedType = resolveTypeForAddon(addon, type, id);
   const { baseUrl, queryParams } = ctx.getAddonBaseURL(addon.url || '');
   const encodedId = encodeURIComponent(id);
   const url = queryParams
-    ? `${baseUrl}/meta/${type}/${encodedId}.json?${queryParams}`
-    : `${baseUrl}/meta/${type}/${encodedId}.json`;
+    ? `${baseUrl}/meta/${resolvedType}/${encodedId}.json?${queryParams}`
+    : `${baseUrl}/meta/${resolvedType}/${encodedId}.json`;
 
   const response = await ctx.retryRequest(() => axios.get(url, createSafeAxiosConfig(10000)));
   return response.data?.meta?.id ? response.data.meta : null;
@@ -226,7 +246,11 @@ export async function getMetaDetails(
   preferredAddonId?: string
 ): Promise<MetaDetails | null> {
   try {
-    if (!(await ctx.isValidContentId(type, id))) {
+    // isValidContentId gate removed — addonCanServeId() handles per-addon ID prefix
+    // filtering correctly. The gate caused false negatives when type was non-standard
+    // or prefixes weren't indexed yet, silently returning null before any addon was tried.
+    const lowerId = (id || '').toLowerCase();
+    if (!id || lowerId === 'null' || lowerId === 'undefined' || lowerId === 'moviebox' || lowerId === 'torbox') {
       return null;
     }
 
@@ -234,7 +258,7 @@ export async function getMetaDetails(
 
     if (preferredAddonId) {
       const preferredAddon = addons.find(addon => addon.id === preferredAddonId);
-      if (preferredAddon?.resources && addonSupportsMetaResource(preferredAddon, type, id)) {
+      if (preferredAddon?.resources && addonCanServeId(preferredAddon, id)) {
         try {
           const meta = await fetchMetaFromAddon(ctx, preferredAddon, type, id);
           if (meta) {
@@ -249,7 +273,7 @@ export async function getMetaDetails(
     for (const baseUrl of ['https://v3-cinemeta.strem.io', 'http://v3-cinemeta.strem.io']) {
       try {
         const encodedId = encodeURIComponent(id);
-        const url = `${baseUrl}/meta/${type}/${encodedId}.json`;
+        const url = `${baseUrl}/meta/${type ? type.toLowerCase() : type}/${encodedId}.json`;
         const response = await ctx.retryRequest(() => axios.get(url, createSafeAxiosConfig(10000)));
         if (response.data?.meta?.id) {
           return response.data.meta;
@@ -264,7 +288,7 @@ export async function getMetaDetails(
         continue;
       }
 
-      if (!addonSupportsMetaResource(addon, type, id)) {
+      if (!addonCanServeId(addon, id)) {
         continue;
       }
 

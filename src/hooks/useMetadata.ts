@@ -722,8 +722,45 @@ export const useMetadata = ({ id, type, addonId }: UseMetadataProps): UseMetadat
         }
       }
 
+      // If normalizedType is not a known type (e.g. "other" from Gemini/AI search),
+      // resolve the correct type via TMDB before fetching addon metadata.
+      let effectiveType = normalizedType;
+      if (normalizedType !== 'movie' && normalizedType !== 'series') {
+        try {
+          if (actualId.startsWith('tt')) {
+            // Use TMDB /find endpoint which returns tv_results + movie_results simultaneously
+            // — gives definitive type in one call with no sequential guessing
+            const tmdbSvc = TMDBService.getInstance();
+            const resolved = await tmdbSvc.findTypeAndIdByIMDB(actualId);
+            if (resolved) {
+              effectiveType = resolved.type;
+              setTmdbId(resolved.tmdbId);
+              if (__DEV__) console.log(`🔍 [useMetadata] Resolved unknown type "${normalizedType}" → "${effectiveType}" via TMDB /find`);
+            }
+          } else if (actualId.startsWith('tmdb:')) {
+            // For tmdb: IDs try both in parallel, prefer series
+            const tmdbSvc = TMDBService.getInstance();
+            const tmdbRaw = parseInt(actualId.split(':')[1]);
+            if (!isNaN(tmdbRaw)) {
+              const [movieResult, seriesResult] = await Promise.allSettled([
+                tmdbSvc.getMovieDetails(String(tmdbRaw)).catch(() => null),
+                tmdbSvc.getTVShowDetails(tmdbRaw).catch(() => null),
+              ]);
+              const hasMovie = movieResult.status === 'fulfilled' && !!movieResult.value;
+              const hasSeries = seriesResult.status === 'fulfilled' && !!seriesResult.value;
+              // Prefer series when both exist (anime/TV tagged as "other" is usually a series)
+              if (hasSeries) effectiveType = 'series';
+              else if (hasMovie) effectiveType = 'movie';
+              if (__DEV__) console.log(`🔍 [useMetadata] Resolved unknown type "${normalizedType}" → "${effectiveType}" via TMDB parallel check`);
+            }
+          }
+        } catch (e) {
+          if (__DEV__) console.log('🔍 [useMetadata] Failed to resolve type via TMDB, using fallback:', e);
+        }
+      }
+
       // Load all data in parallel
-      if (__DEV__) logger.log('[loadMetadata] fetching addon metadata', { type, actualId, addonId });
+      if (__DEV__) logger.log('[loadMetadata] fetching addon metadata', { type: effectiveType, actualId, addonId });
 
       let contentResult: any = null;
       let lastError = null;
@@ -758,7 +795,7 @@ export const useMetadata = ({ id, type, addonId }: UseMetadataProps): UseMetadat
               for (const addon of externalMetaAddons) {
                 try {
                   const result = await withTimeout(
-                    stremioService.getMetaDetails(normalizedType, actualId, addon.id),
+                    stremioService.getMetaDetails(effectiveType, actualId, addon.id),
                     API_TIMEOUT
                   );
                   
@@ -775,7 +812,7 @@ export const useMetadata = ({ id, type, addonId }: UseMetadataProps): UseMetadat
               
               // If no external addon worked, fall back to catalog addon
               const result = await withTimeout(
-                catalogService.getEnhancedContentDetails(normalizedType, actualId, addonId),
+                catalogService.getEnhancedContentDetails(effectiveType, actualId, addonId),
                 API_TIMEOUT
               );
               if (actualId.startsWith('tt')) {
@@ -804,7 +841,7 @@ export const useMetadata = ({ id, type, addonId }: UseMetadataProps): UseMetadat
             // Load content with timeout and retry
             withRetry(async () => {
               const result = await withTimeout(
-                catalogService.getEnhancedContentDetails(normalizedType, actualId, addonId),
+                catalogService.getEnhancedContentDetails(effectiveType, actualId, addonId),
                 API_TIMEOUT
               );
               // Store the actual ID used (could be IMDB)
@@ -841,7 +878,7 @@ export const useMetadata = ({ id, type, addonId }: UseMetadataProps): UseMetadat
               const [content, castData] = await Promise.allSettled([
                 withRetry(async () => {
                   const result = await withTimeout(
-                    catalogService.getEnhancedContentDetails(normalizedType, stremioId, addonId),
+                    catalogService.getEnhancedContentDetails(effectiveType, stremioId, addonId),
                     API_TIMEOUT
                   );
                   if (stremioId.startsWith('tt')) {
