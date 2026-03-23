@@ -10,7 +10,7 @@ import { logger } from '../../../utils/logger';
 import { TRAKT_RECONCILE_COOLDOWN, TRAKT_SYNC_COOLDOWN } from './constants';
 import { GetCachedMetadata, LocalProgressEntry } from './dataTypes';
 import {
-  buildTraktContentData,
+  // CHANGE: removed unused buildTraktContentData import
   filterRemovedItems,
   findNextEpisode,
   getHighestLocalMatch,
@@ -18,7 +18,7 @@ import {
   getMostRecentLocalMatch,
 } from './dataShared';
 import { ContinueWatchingItem } from './types';
-import { compareContinueWatchingItems } from './utils';
+// CHANGE: removed unused compareContinueWatchingItems import (final sort now inline)
 
 interface MergeTraktContinueWatchingParams {
   traktService: TraktService;
@@ -31,6 +31,23 @@ interface MergeTraktContinueWatchingParams {
   setContinueWatchingItems: Dispatch<SetStateAction<ContinueWatchingItem[]>>;
 }
 
+// CHANGE: Added bulletproof time parser to prevent NaN from breaking sort algorithm.
+// Previously used `new Date(value).getTime()` inline which could produce NaN and
+// cause unpredictable sort order.
+const getValidTime = (dateVal: any): number => {
+  if (!dateVal) return 0;
+  if (typeof dateVal === 'number') return isNaN(dateVal) ? 0 : dateVal;
+  if (typeof dateVal === 'string') {
+    const parsed = new Date(dateVal).getTime();
+    return isNaN(parsed) ? 0 : parsed;
+  }
+  if (dateVal instanceof Date) {
+    const parsed = dateVal.getTime();
+    return isNaN(parsed) ? 0 : parsed;
+  }
+  return 0;
+};
+
 export async function mergeTraktContinueWatching({
   traktService,
   getCachedMetadata,
@@ -41,6 +58,16 @@ export async function mergeTraktContinueWatching({
   lastTraktReconcileRef,
   setContinueWatchingItems,
 }: MergeTraktContinueWatchingParams): Promise<void> {
+
+  // CHANGE: Added auth check at the top. If user is not authenticated,
+  // clear the list immediately and return. The `await` is required —
+  // without it isAuthenticated() returns a Promise (always truthy) and
+  // the check never fires.
+  if (!await traktService.isAuthenticated()) {
+    setContinueWatchingItems([]);
+    return;
+  }
+
   const now = Date.now();
   if (
     TRAKT_SYNC_COOLDOWN > 0 &&
@@ -53,76 +80,77 @@ export async function mergeTraktContinueWatching({
   }
 
   lastTraktSyncRef.current = now;
-  const playbackItems = await traktService.getPlaybackProgress();
   const traktBatch: ContinueWatchingItem[] = [];
 
+  // CHANGE: Moved API calls into a try/catch so that a failed/expired token
+  // clears the list instead of leaving stale items on screen.
+  let playbackItems: any[] = [];
   let watchedShowsData: TraktWatchedItem[] = [];
+
+  try {
+    playbackItems = await traktService.getPlaybackProgress();
+    watchedShowsData = await traktService.getWatchedShows();
+  } catch (err) {
+    logger.warn('[TraktSync] API failed (likely disconnected or expired token):', err);
+    setContinueWatchingItems([]);
+    return;
+  }
+
   const watchedEpisodeSetByShow = new Map<string, Set<string>>();
 
   try {
-    watchedShowsData = await traktService.getWatchedShows();
     for (const watchedShow of watchedShowsData) {
       if (!watchedShow.show?.ids?.imdb) continue;
 
       const imdb = watchedShow.show.ids.imdb.startsWith('tt')
         ? watchedShow.show.ids.imdb
         : `tt${watchedShow.show.ids.imdb}`;
-      const resetAt = watchedShow.reset_at ? new Date(watchedShow.reset_at).getTime() : 0;
+
+      // CHANGE: Use getValidTime instead of `new Date(...).getTime()`
+      const resetAt = getValidTime(watchedShow.reset_at);
       const episodeSet = new Set<string>();
 
       if (watchedShow.seasons) {
         for (const season of watchedShow.seasons) {
           for (const episode of season.episodes) {
             if (resetAt > 0) {
-              const watchedAt = new Date(episode.last_watched_at).getTime();
+              const watchedAt = getValidTime(episode.last_watched_at);
               if (watchedAt < resetAt) continue;
             }
-
             episodeSet.add(`${imdb}:${season.number}:${episode.number}`);
           }
         }
       }
-
       watchedEpisodeSetByShow.set(imdb, episodeSet);
     }
-  } catch {
-    // Continue without watched-show acceleration.
+  } catch (err) {
+    logger.warn('[TraktSync] Error mapping watched shows:', err);
   }
 
   const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
-  const sortedPlaybackItems = [...playbackItems]
-  .sort((a, b) => {
-    const getBaseTime = (item: any) =>
-      new Date(
-        item.paused_at || 
-        item.updated_at || 
-        item.last_watched_at || 
-        0
-      ).getTime();
 
-    const getPriorityTime = (item: any) => {
-      const base = getBaseTime(item);
-      // NEW EPISODE PRIORITY BOOST
-      if (item.episode && (item.progress ?? 0) < 1) {
-        const aired = new Date(item.episode.first_aired || 0).getTime();
-        const daysSinceAired = (Date.now() - aired) / (1000 * 60 * 60 * 24);
-        if (daysSinceAired >= 0 && daysSinceAired < 60) {
-          return base + 1000000000; // boost to top on aired ep
-        }
-      }
-      return base;
-    };
-
-    return getPriorityTime(b) - getPriorityTime(a);
-  })
-  .slice(0, 30);
+  // CHANGE: Simplified sort — removed the +1000000000 "new episode priority boost"
+  // that was added by a previous AI suggestion. That boost caused recently aired
+  // episodes to incorrectly sort above items the user actually paused recently,
+  // breaking the expected Trakt continue watching order on initial login.
+  // Now sorts purely by most recent timestamp, newest first.
+  const sortedPlaybackItems = [...(playbackItems || [])]
+    .sort((a, b) => {
+      const timeA = getValidTime(a.paused_at || a.updated_at || a.last_watched_at);
+      const timeB = getValidTime(b.paused_at || b.updated_at || b.last_watched_at);
+      return timeB - timeA;
+    })
+    .slice(0, 30);
 
   for (const item of sortedPlaybackItems) {
     try {
       if (item.progress < 2) continue;
 
-      const pausedAt = new Date(item.paused_at).getTime();
-      if (pausedAt < thirtyDaysAgo) continue;
+      // CHANGE: Use getValidTime with fallback to updated_at for items missing paused_at
+      const pausedAt = getValidTime(item.paused_at || item.updated_at);
+
+      // CHANGE: Guard against items where pausedAt resolved to 0 (missing/invalid date)
+      if (pausedAt > 0 && pausedAt < thirtyDaysAgo) continue;
 
       if (item.type === 'movie' && item.movie?.ids?.imdb) {
         if (item.progress >= 85) continue;
@@ -176,7 +204,10 @@ export async function mergeTraktContinueWatching({
                 id: showImdb,
                 type: 'series',
                 progress: 0,
-                lastUpdated: nextEpisodeResult.lastWatched,
+                // CHANGE: Use pausedAt (from playback item) instead of
+                // nextEpisodeResult.lastWatched so sort order stays consistent
+                // with when the user actually paused, not local watch timestamps.
+                lastUpdated: pausedAt,
                 season: nextEpisode.season,
                 episode: nextEpisode.episode,
                 episodeTitle: nextEpisode.title || `Episode ${nextEpisode.episode}`,
@@ -185,7 +216,6 @@ export async function mergeTraktContinueWatching({
               } as ContinueWatchingItem);
             }
           }
-
           continue;
         }
 
@@ -208,14 +238,28 @@ export async function mergeTraktContinueWatching({
   }
 
   try {
-    const thirtyDaysAgoForShows = Date.now() - (30 * 24 * 60 * 60 * 1000);
+    // CHANGE: Extended window from 30 days to 6 months for watched shows
+    // so up next items from less frequent viewing aren't excluded.
+    const sixMonthsAgo = Date.now() - (180 * 24 * 60 * 60 * 1000);
 
-    for (const watchedShow of watchedShowsData) {
+    // CHANGE: Pre-sort and slice watched shows by recency before processing,
+    // so the most recently watched shows are processed first and up next items
+    // sort correctly alongside playback items.
+    const sortedWatchedShows = [...(watchedShowsData || [])]
+      .filter((show) => {
+        const watchedAt = getValidTime(show.last_watched_at);
+        return watchedAt > sixMonthsAgo;
+      })
+      .sort((a, b) => {
+        const timeA = getValidTime(a.last_watched_at);
+        const timeB = getValidTime(b.last_watched_at);
+        return timeB - timeA;
+      })
+      .slice(0, 30);
+
+    for (const watchedShow of sortedWatchedShows) {
       try {
         if (!watchedShow.show?.ids?.imdb) continue;
-
-        const lastWatchedAt = new Date(watchedShow.last_watched_at).getTime();
-        if (lastWatchedAt < thirtyDaysAgoForShows) continue;
 
         const showImdb = watchedShow.show.ids.imdb.startsWith('tt')
           ? watchedShow.show.ids.imdb
@@ -223,7 +267,7 @@ export async function mergeTraktContinueWatching({
 
         if (recentlyRemoved.has(`series:${showImdb}`)) continue;
 
-        const resetAt = watchedShow.reset_at ? new Date(watchedShow.reset_at).getTime() : 0;
+        const resetAt = getValidTime(watchedShow.reset_at);
         let lastWatchedSeason = 0;
         let lastWatchedEpisode = 0;
         let latestEpisodeTimestamp = 0;
@@ -231,7 +275,7 @@ export async function mergeTraktContinueWatching({
         if (watchedShow.seasons) {
           for (const season of watchedShow.seasons) {
             for (const episode of season.episodes) {
-              const episodeTimestamp = new Date(episode.last_watched_at).getTime();
+              const episodeTimestamp = getValidTime(episode.last_watched_at);
               if (resetAt > 0 && episodeTimestamp < resetAt) continue;
 
               if (episodeTimestamp > latestEpisodeTimestamp) {
@@ -267,7 +311,9 @@ export async function mergeTraktContinueWatching({
             id: showImdb,
             type: 'series',
             progress: 0,
-            lastUpdated: nextEpisodeResult.lastWatched,
+            // CHANGE: Use latestEpisodeTimestamp directly (when user finished the
+            // last episode) so up next items sort by actual watch recency.
+            lastUpdated: latestEpisodeTimestamp,
             season: nextEpisode.season,
             episode: nextEpisode.episode,
             episodeTitle: nextEpisode.title || `Episode ${nextEpisode.episode}`,
@@ -279,10 +325,14 @@ export async function mergeTraktContinueWatching({
       }
     }
   } catch (err) {
-    logger.warn('[TraktSync] Error fetching watched shows for Up Next:', err);
+    logger.warn('[TraktSync] Error processing watched shows for Up Next:', err);
   }
 
+  // CHANGE: Clear list on empty batch instead of silently returning.
+  // Previously `return` here left stale items on screen when Trakt returned
+  // nothing (e.g. fresh login or just after disconnect).
   if (traktBatch.length === 0) {
+    setContinueWatchingItems([]);
     return;
   }
 
@@ -299,26 +349,31 @@ export async function mergeTraktContinueWatching({
     const existingHasProgress = (existing.progress ?? 0) > 0;
     const candidateHasProgress = (item.progress ?? 0) > 0;
 
+    // CHANGE: Use getValidTime for safe timestamp comparison in dedup logic
+    const safeItemTs = getValidTime(item.lastUpdated);
+    const safeExistingTs = getValidTime(existing.lastUpdated);
+
     if (candidateHasProgress && !existingHasProgress) {
-      const mergedTs = Math.max(item.lastUpdated ?? 0, existing.lastUpdated ?? 0);
+      const mergedTs = Math.max(safeItemTs, safeExistingTs);
       deduped.set(
         key,
-        mergedTs !== (item.lastUpdated ?? 0)
+        mergedTs !== safeItemTs
           ? { ...item, lastUpdated: mergedTs }
           : item
       );
     } else if (!candidateHasProgress && existingHasProgress) {
-      if ((item.lastUpdated ?? 0) > (existing.lastUpdated ?? 0)) {
-        deduped.set(key, { ...existing, lastUpdated: item.lastUpdated });
+      if (safeItemTs > safeExistingTs) {
+        deduped.set(key, { ...existing, lastUpdated: safeItemTs });
       }
-    } else if ((item.lastUpdated ?? 0) > (existing.lastUpdated ?? 0)) {
+    } else if (safeItemTs > safeExistingTs) {
       deduped.set(key, item);
     }
   }
 
   const filteredItems = await filterRemovedItems(Array.from(deduped.values()), recentlyRemoved);
-  const reconcilePromises: Promise<any>[] = [];
   const reconcileLocalPromises: Promise<any>[] = [];
+  // CHANGE: Removed reconcilePromises (Trakt back-sync) — that logic was pushing
+  // local progress back to Trakt which is out of scope for continue watching display.
 
   const adjustedItems = filteredItems
     .map((item) => {
@@ -332,14 +387,14 @@ export async function mergeTraktContinueWatching({
         return item;
       }
 
-      const mergedLastUpdated = Math.max(
-        mostRecentLocal.lastUpdated ?? 0,
-        item.lastUpdated ?? 0
-      );
+      // CHANGE: Use getValidTime for safe timestamp extraction
+      const safeLocalTs = getValidTime(mostRecentLocal.lastUpdated);
+      const safeItemTs = getValidTime(item.lastUpdated);
+
       const localProgress = mostRecentLocal.progressPercent;
       const traktProgress = item.progress ?? 0;
-      const traktTs = item.lastUpdated ?? 0;
-      const localTs = mostRecentLocal.lastUpdated ?? 0;
+      const traktTs = safeItemTs;
+      const localTs = safeLocalTs;
 
       const isAhead = isFinite(localProgress) && localProgress > traktProgress + 0.5;
       const isLocalNewer = localTs > traktTs + 5000;
@@ -401,49 +456,34 @@ export async function mergeTraktContinueWatching({
         }
       }
 
-      if ((isAhead || ((isLocalNewer || isLocalRecent) && isDifferent)) && localProgress >= 2) {
-        const reconcileKey = `${item.type}:${item.id}:${item.season ?? ''}:${item.episode ?? ''}`;
-        const last = lastTraktReconcileRef.current.get(reconcileKey) ?? 0;
-        const now = Date.now();
-
-        if (now - last >= TRAKT_RECONCILE_COOLDOWN) {
-          lastTraktReconcileRef.current.set(reconcileKey, now);
-
-          const contentData = buildTraktContentData(item);
-          if (contentData) {
-            const progressToSend =
-              localProgress >= 85
-                ? Math.min(localProgress, 100)
-                : Math.min(localProgress, 79.9);
-
-            reconcilePromises.push(
-              traktService.pauseWatching(contentData, progressToSend).catch(() => null)
-            );
-          }
-        }
-      }
-
+      // CHANGE: Return safeItemTs (Trakt's paused_at timestamp) instead of
+      // mergedLastUpdated (which took the MAX of local and Trakt timestamps).
+      // The old approach let local storage timestamps corrupt sort order on the
+      // 4-second trailing refresh — a show watched locally months ago would get
+      // a recent local timestamp and jump to the top of the list.
       if (((isLocalNewer || isLocalRecent) && isDifferent) || isAhead) {
         return {
           ...item,
           progress: localProgress,
-          lastUpdated: mergedLastUpdated,
+          lastUpdated: safeItemTs, // keep Trakt timestamp, only update progress
         };
       }
 
       return {
         ...item,
-        lastUpdated: mergedLastUpdated,
+        lastUpdated: safeItemTs, // keep Trakt timestamp for sort stability
       };
     })
     .filter((item) => (item.progress ?? 0) < 85);
 
-  adjustedItems.sort(compareContinueWatchingItems);
-  setContinueWatchingItems(adjustedItems);
+  // CHANGE: Replaced compareContinueWatchingItems (from utils) with an inline
+  // sort using getValidTime so NaN timestamps can't affect order, and all items
+  // (both playback and up next) sort together by recency.
+  const finalItems = adjustedItems
+    .sort((a, b) => getValidTime(b.lastUpdated) - getValidTime(a.lastUpdated))
+    .slice(0, 30);
 
-  if (reconcilePromises.length > 0) {
-    Promise.allSettled(reconcilePromises).catch(() => null);
-  }
+  setContinueWatchingItems(finalItems);
 
   if (reconcileLocalPromises.length > 0) {
     Promise.allSettled(reconcileLocalPromises).catch(() => null);
