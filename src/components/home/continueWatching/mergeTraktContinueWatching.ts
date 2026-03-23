@@ -7,10 +7,18 @@ import {
 } from '../../../services/traktService';
 import { logger } from '../../../utils/logger';
 
-import { TRAKT_RECONCILE_COOLDOWN, TRAKT_SYNC_COOLDOWN } from './constants';
+import {
+  CW_DEFAULT_DAYS_CAP,
+  CW_HISTORY_MAX_PAGES,
+  CW_HISTORY_PAGE_LIMIT,
+  CW_MAX_DISPLAY_ITEMS,
+  CW_MAX_NEXT_UP_LOOKUPS,
+  CW_MAX_RECENT_PROGRESS_ITEMS,
+  TRAKT_RECONCILE_COOLDOWN,
+  TRAKT_SYNC_COOLDOWN,
+} from './constants';
 import { GetCachedMetadata, LocalProgressEntry } from './dataTypes';
 import {
-  // CHANGE: removed unused buildTraktContentData import
   filterRemovedItems,
   findNextEpisode,
   getHighestLocalMatch,
@@ -18,7 +26,6 @@ import {
   getMostRecentLocalMatch,
 } from './dataShared';
 import { ContinueWatchingItem } from './types';
-// CHANGE: removed unused compareContinueWatchingItems import (final sort now inline)
 
 interface MergeTraktContinueWatchingParams {
   traktService: TraktService;
@@ -80,22 +87,55 @@ export async function mergeTraktContinueWatching({
   }
 
   lastTraktSyncRef.current = now;
-  const traktBatch: ContinueWatchingItem[] = [];
 
-  // CHANGE: Moved API calls into a try/catch so that a failed/expired token
-  // clears the list instead of leaving stale items on screen.
+  // ─── 1. Fetch all Trakt data sources (matching NuvioTV) ───
   let playbackItems: any[] = [];
   let watchedShowsData: TraktWatchedItem[] = [];
+  let episodeHistoryItems: any[] = [];
 
   try {
-    playbackItems = await traktService.getPlaybackProgress();
-    watchedShowsData = await traktService.getWatchedShows();
+    const [playbackResult, watchedResult] = await Promise.all([
+      traktService.getPlaybackProgress(),
+      traktService.getWatchedShows(),
+    ]);
+    playbackItems = playbackResult;
+    watchedShowsData = watchedResult;
+    logger.log(`[TraktCW] Fetched ${playbackItems?.length ?? 0} playback items, ${watchedShowsData?.length ?? 0} watched shows`);
   } catch (err) {
     logger.warn('[TraktSync] API failed (likely disconnected or expired token):', err);
     setContinueWatchingItems([]);
     return;
   }
 
+  // Fetch episode history (matching NuvioTV's fetchRecentEpisodeHistorySnapshot)
+  try {
+    const historyResults: any[] = [];
+    const seenContentIds = new Set<string>();
+    for (let page = 1; page <= CW_HISTORY_MAX_PAGES; page++) {
+      const pageItems = await traktService.getWatchedEpisodesHistory(page, CW_HISTORY_PAGE_LIMIT);
+      if (!pageItems || pageItems.length === 0) break;
+
+      for (const item of pageItems) {
+        const showImdb = item.show?.ids?.imdb;
+        if (!showImdb) continue;
+        const normalizedId = showImdb.startsWith('tt') ? showImdb : `tt${showImdb}`;
+        // NuvioTV deduplicates by contentId (one per show), keeping the most recent
+        if (seenContentIds.has(normalizedId)) continue;
+        seenContentIds.add(normalizedId);
+        historyResults.push(item);
+        if (historyResults.length >= CW_MAX_RECENT_PROGRESS_ITEMS) break;
+      }
+
+      if (historyResults.length >= CW_MAX_RECENT_PROGRESS_ITEMS) break;
+      if (pageItems.length < CW_HISTORY_PAGE_LIMIT) break;
+    }
+    episodeHistoryItems = historyResults;
+    logger.log(`[TraktCW] Fetched ${episodeHistoryItems.length} episode history items (unique shows)`);
+  } catch (err) {
+    logger.warn('[TraktSync] Failed to fetch episode history:', err);
+  }
+
+  // ─── 2. Build watched episode sets per show ───
   const watchedEpisodeSetByShow = new Map<string, Set<string>>();
 
   try {
@@ -106,7 +146,6 @@ export async function mergeTraktContinueWatching({
         ? watchedShow.show.ids.imdb
         : `tt${watchedShow.show.ids.imdb}`;
 
-      // CHANGE: Use getValidTime instead of `new Date(...).getTime()`
       const resetAt = getValidTime(watchedShow.reset_at);
       const episodeSet = new Set<string>();
 
@@ -127,124 +166,205 @@ export async function mergeTraktContinueWatching({
     logger.warn('[TraktSync] Error mapping watched shows:', err);
   }
 
-  const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
+  // ─── 3. Merge sources: history first, then playback overwrites (matching NuvioTV) ───
+  // NuvioTV merges in order: recentCompletedEpisodes → (inProgressMovies + inProgressEpisodes)
+  // Later entries overwrite earlier ones by key, so playback (in-progress) takes priority.
 
-  // CHANGE: Simplified sort — removed the +1000000000 "new episode priority boost"
-  // that was added by a previous AI suggestion. That boost caused recently aired
-  // episodes to incorrectly sort above items the user actually paused recently,
-  // breaking the expected Trakt continue watching order on initial login.
-  // Now sorts purely by most recent timestamp, newest first.
+  const daysCutoff = Date.now() - (CW_DEFAULT_DAYS_CAP * 24 * 60 * 60 * 1000);
+
+  // Internal progress items keyed by "type:contentId" for series or "type:contentId" for movies
+  interface ProgressEntry {
+    contentId: string;
+    contentType: 'movie' | 'series';
+    season?: number;
+    episode?: number;
+    episodeTitle?: string;
+    progressPercent: number; // 0-100
+    lastWatched: number;
+    source: 'playback' | 'history' | 'watched_show';
+    traktPlaybackId?: number;
+  }
+
+  const mergedByKey = new Map<string, ProgressEntry>();
+
+  // 3a. Episode history items (completed episodes) — go in first, can be overwritten by playback
+  for (const item of episodeHistoryItems) {
+    try {
+      const show = item.show;
+      const episode = item.episode;
+      if (!show?.ids?.imdb || !episode) continue;
+
+      const showImdb = show.ids.imdb.startsWith('tt')
+        ? show.ids.imdb
+        : `tt${show.ids.imdb}`;
+      const lastWatched = getValidTime(item.watched_at);
+      if (lastWatched > 0 && lastWatched < daysCutoff) continue;
+
+      const key = showImdb; // NuvioTV uses contentId as key (one per show)
+      mergedByKey.set(key, {
+        contentId: showImdb,
+        contentType: 'series',
+        season: episode.season,
+        episode: episode.number,
+        episodeTitle: episode.title,
+        progressPercent: 100, // Completed
+        lastWatched,
+        source: 'history',
+      });
+    } catch {
+      // Skip bad items
+    }
+  }
+
+  // 3b. Playback items (in-progress) — overwrite history entries for the same content
   const sortedPlaybackItems = [...(playbackItems || [])]
     .sort((a, b) => {
       const timeA = getValidTime(a.paused_at || a.updated_at || a.last_watched_at);
       const timeB = getValidTime(b.paused_at || b.updated_at || b.last_watched_at);
       return timeB - timeA;
     })
-    .slice(0, 30);
+    .slice(0, CW_MAX_RECENT_PROGRESS_ITEMS);
 
   for (const item of sortedPlaybackItems) {
     try {
       if (item.progress < 2) continue;
 
-      // CHANGE: Use getValidTime with fallback to updated_at for items missing paused_at
       const pausedAt = getValidTime(item.paused_at || item.updated_at);
-
-      // CHANGE: Guard against items where pausedAt resolved to 0 (missing/invalid date)
-      if (pausedAt > 0 && pausedAt < thirtyDaysAgo) continue;
+      if (pausedAt > 0 && pausedAt < daysCutoff) continue;
 
       if (item.type === 'movie' && item.movie?.ids?.imdb) {
-        if (item.progress >= 85) continue;
-
         const imdbId = item.movie.ids.imdb.startsWith('tt')
           ? item.movie.ids.imdb
           : `tt${item.movie.ids.imdb}`;
 
-        if (recentlyRemoved.has(`movie:${imdbId}`)) continue;
-
-        const cachedData = await getCachedMetadata('movie', imdbId);
-        if (!cachedData?.basicContent) continue;
-
-        traktBatch.push({
-          ...cachedData.basicContent,
-          id: imdbId,
-          type: 'movie',
-          progress: item.progress,
-          lastUpdated: pausedAt,
-          addonId: undefined,
+        const key = imdbId;
+        mergedByKey.set(key, {
+          contentId: imdbId,
+          contentType: 'movie',
+          progressPercent: item.progress,
+          lastWatched: pausedAt,
+          source: 'playback',
           traktPlaybackId: item.id,
-        } as ContinueWatchingItem);
+        });
       } else if (item.type === 'episode' && item.show?.ids?.imdb && item.episode) {
         const showImdb = item.show.ids.imdb.startsWith('tt')
           ? item.show.ids.imdb
           : `tt${item.show.ids.imdb}`;
 
-        if (recentlyRemoved.has(`series:${showImdb}`)) continue;
-
-        const cachedData = await getCachedMetadata('series', showImdb);
-        if (!cachedData?.basicContent) continue;
-
-        if (item.progress >= 85) {
-          if (cachedData.metadata?.videos) {
-            const watchedSetForShow = watchedEpisodeSetByShow.get(showImdb);
-            const localWatchedMap = await localWatchedShowsMapPromise;
-            const nextEpisodeResult = findNextEpisode(
-              item.episode.season,
-              item.episode.number,
-              cachedData.metadata.videos,
-              watchedSetForShow,
-              showImdb,
-              localWatchedMap,
-              pausedAt
-            );
-
-            if (nextEpisodeResult) {
-              const nextEpisode = nextEpisodeResult.video;
-              traktBatch.push({
-                ...cachedData.basicContent,
-                id: showImdb,
-                type: 'series',
-                progress: 0,
-                // CHANGE: Use pausedAt (from playback item) instead of
-                // nextEpisodeResult.lastWatched so sort order stays consistent
-                // with when the user actually paused, not local watch timestamps.
-                lastUpdated: pausedAt,
-                season: nextEpisode.season,
-                episode: nextEpisode.episode,
-                episodeTitle: nextEpisode.title || `Episode ${nextEpisode.episode}`,
-                addonId: undefined,
-                traktPlaybackId: item.id,
-              } as ContinueWatchingItem);
-            }
-          }
-          continue;
-        }
-
-        traktBatch.push({
-          ...cachedData.basicContent,
-          id: showImdb,
-          type: 'series',
-          progress: item.progress,
-          lastUpdated: pausedAt,
+        const key = showImdb;
+        mergedByKey.set(key, {
+          contentId: showImdb,
+          contentType: 'series',
           season: item.episode.season,
           episode: item.episode.number,
-          episodeTitle: item.episode.title || `Episode ${item.episode.number}`,
-          addonId: undefined,
+          episodeTitle: item.episode.title,
+          progressPercent: item.progress,
+          lastWatched: pausedAt,
+          source: 'playback',
           traktPlaybackId: item.id,
-        } as ContinueWatchingItem);
+        });
       }
     } catch {
       // Continue with remaining playback items.
     }
   }
 
-  try {
-    // CHANGE: Extended window from 30 days to 6 months for watched shows
-    // so up next items from less frequent viewing aren't excluded.
-    const sixMonthsAgo = Date.now() - (180 * 24 * 60 * 60 * 1000);
+  // ─── 4. Sort merged items by lastWatched and apply cap ───
+  const allMerged = Array.from(mergedByKey.values())
+    .sort((a, b) => b.lastWatched - a.lastWatched)
+    .slice(0, CW_MAX_RECENT_PROGRESS_ITEMS);
 
-    // CHANGE: Pre-sort and slice watched shows by recency before processing,
-    // so the most recently watched shows are processed first and up next items
-    // sort correctly alongside playback items.
+  logger.log(`[TraktCW] Merged ${allMerged.length} items (history→playback). Breakdown: ${allMerged.filter(e => e.source === 'history').length} history, ${allMerged.filter(e => e.source === 'playback').length} playback`);
+  for (const entry of allMerged.slice(0, 15)) {
+    logger.log(`[TraktCW]   ${entry.contentType} ${entry.contentId} S${entry.season ?? '-'}E${entry.episode ?? '-'} progress=${entry.progressPercent.toFixed(1)}% src=${entry.source} last=${new Date(entry.lastWatched).toISOString()}`);
+  }
+  if (allMerged.length > 15) logger.log(`[TraktCW]   ... and ${allMerged.length - 15} more`);
+
+  // ─── 5. Separate in-progress items vs completed seeds (matching NuvioTV pipeline) ───
+  // In-progress: 2% ≤ progress < 85%
+  // Completed seed: progress ≥ 85% (will be used for Up Next)
+  const inProgressEntries: ProgressEntry[] = [];
+  const completedSeeds: ProgressEntry[] = [];
+
+  for (const entry of allMerged) {
+    if (entry.progressPercent >= 2 && entry.progressPercent < 85) {
+      inProgressEntries.push(entry);
+    } else if (entry.progressPercent >= 85) {
+      completedSeeds.push(entry);
+    }
+  }
+
+  logger.log(`[TraktCW] Separated: ${inProgressEntries.length} in-progress (2-85%), ${completedSeeds.length} completed seeds (≥85%)`);
+
+  // ─── 6. Episode deduplication for in-progress (matching NuvioTV deduplicateInProgress) ───
+  // For series: only keep the latest-watched episode per series
+  const dedupedInProgress: ProgressEntry[] = [];
+  const seriesLatest = new Map<string, ProgressEntry>();
+
+  for (const entry of inProgressEntries) {
+    if (entry.contentType === 'series') {
+      const existing = seriesLatest.get(entry.contentId);
+      if (!existing || entry.lastWatched > existing.lastWatched) {
+        seriesLatest.set(entry.contentId, entry);
+      }
+    } else {
+      dedupedInProgress.push(entry);
+    }
+  }
+  dedupedInProgress.push(...seriesLatest.values());
+  dedupedInProgress.sort((a, b) => b.lastWatched - a.lastWatched);
+
+  logger.log(`[TraktCW] After series dedup: ${dedupedInProgress.length} in-progress items (was ${inProgressEntries.length})`);
+  for (const entry of dedupedInProgress) {
+    logger.log(`[TraktCW]   IN-PROGRESS: ${entry.contentType} ${entry.contentId} S${entry.season ?? '-'}E${entry.episode ?? '-'} progress=${entry.progressPercent.toFixed(1)}% last=${new Date(entry.lastWatched).toISOString()}`);
+  }
+
+  // ─── 7. Build in-progress ContinueWatchingItems ───
+  const traktBatch: ContinueWatchingItem[] = [];
+  const inProgressSeriesIds = new Set<string>();
+
+  for (const entry of dedupedInProgress) {
+    if (recentlyRemoved.has(`${entry.contentType}:${entry.contentId}`)) continue;
+
+    const type = entry.contentType === 'movie' ? 'movie' : 'series';
+    const cachedData = await getCachedMetadata(type, entry.contentId);
+    if (!cachedData?.basicContent) continue;
+
+    if (entry.contentType === 'series') {
+      inProgressSeriesIds.add(entry.contentId);
+    }
+
+    traktBatch.push({
+      ...cachedData.basicContent,
+      id: entry.contentId,
+      type: type,
+      progress: entry.progressPercent,
+      lastUpdated: entry.lastWatched,
+      season: entry.season,
+      episode: entry.episode,
+      episodeTitle: entry.episodeTitle || (entry.episode ? `Episode ${entry.episode}` : undefined),
+      addonId: undefined,
+      traktPlaybackId: entry.traktPlaybackId,
+    } as ContinueWatchingItem);
+  }
+
+  logger.log(`[TraktCW] Built ${traktBatch.length} in-progress CW items. Suppressed series IDs: [${Array.from(inProgressSeriesIds).join(', ')}]`);
+
+  // ─── 8. Build Up Next items from completed seeds (matching NuvioTV buildLightweightNextUpItems) ───
+  // Completed seeds from playback + history: find next episode for each
+  const nextUpSeeds: ProgressEntry[] = [];
+
+  // Add completed entries from merged data
+  for (const entry of completedSeeds) {
+    if (entry.contentType !== 'series') continue;
+    if (inProgressSeriesIds.has(entry.contentId)) continue; // Next-up suppression
+    if (recentlyRemoved.has(`series:${entry.contentId}`)) continue;
+    nextUpSeeds.push(entry);
+  }
+
+  // ─── 9. Add watched show seeds (matching NuvioTV observeWatchedShowSeeds) ───
+  try {
+    const sixMonthsAgo = Date.now() - (180 * 24 * 60 * 60 * 1000);
     const sortedWatchedShows = [...(watchedShowsData || [])]
       .filter((show) => {
         const watchedAt = getValidTime(show.last_watched_at);
@@ -254,8 +374,7 @@ export async function mergeTraktContinueWatching({
         const timeA = getValidTime(a.last_watched_at);
         const timeB = getValidTime(b.last_watched_at);
         return timeB - timeA;
-      })
-      .slice(0, 30);
+      });
 
     for (const watchedShow of sortedWatchedShows) {
       try {
@@ -265,7 +384,12 @@ export async function mergeTraktContinueWatching({
           ? watchedShow.show.ids.imdb
           : `tt${watchedShow.show.ids.imdb}`;
 
+        // Skip if already in in-progress (next-up suppression)
+        if (inProgressSeriesIds.has(showImdb)) continue;
         if (recentlyRemoved.has(`series:${showImdb}`)) continue;
+
+        // Skip if we already have a seed for this show (from playback/history)
+        if (nextUpSeeds.some(s => s.contentId === showImdb)) continue;
 
         const resetAt = getValidTime(watchedShow.reset_at);
         let lastWatchedSeason = 0;
@@ -289,37 +413,15 @@ export async function mergeTraktContinueWatching({
 
         if (lastWatchedSeason === 0 && lastWatchedEpisode === 0) continue;
 
-        const cachedData = await getCachedMetadata('series', showImdb);
-        if (!cachedData?.basicContent || !cachedData.metadata?.videos) continue;
-
-        const watchedEpisodeSet = watchedEpisodeSetByShow.get(showImdb) ?? new Set<string>();
-        const localWatchedMap = await localWatchedShowsMapPromise;
-        const nextEpisodeResult = findNextEpisode(
-          lastWatchedSeason,
-          lastWatchedEpisode,
-          cachedData.metadata.videos,
-          watchedEpisodeSet,
-          showImdb,
-          localWatchedMap,
-          latestEpisodeTimestamp
-        );
-
-        if (nextEpisodeResult) {
-          const nextEpisode = nextEpisodeResult.video;
-          traktBatch.push({
-            ...cachedData.basicContent,
-            id: showImdb,
-            type: 'series',
-            progress: 0,
-            // CHANGE: Use latestEpisodeTimestamp directly (when user finished the
-            // last episode) so up next items sort by actual watch recency.
-            lastUpdated: latestEpisodeTimestamp,
-            season: nextEpisode.season,
-            episode: nextEpisode.episode,
-            episodeTitle: nextEpisode.title || `Episode ${nextEpisode.episode}`,
-            addonId: undefined,
-          } as ContinueWatchingItem);
-        }
+        nextUpSeeds.push({
+          contentId: showImdb,
+          contentType: 'series',
+          season: lastWatchedSeason,
+          episode: lastWatchedEpisode,
+          progressPercent: 100,
+          lastWatched: latestEpisodeTimestamp,
+          source: 'watched_show',
+        });
       } catch {
         // Continue with remaining watched shows.
       }
@@ -328,14 +430,101 @@ export async function mergeTraktContinueWatching({
     logger.warn('[TraktSync] Error processing watched shows for Up Next:', err);
   }
 
-  // CHANGE: Clear list on empty batch instead of silently returning.
-  // Previously `return` here left stale items on screen when Trakt returned
-  // nothing (e.g. fresh login or just after disconnect).
+  // ─── 10. Choose preferred seed per show (matching NuvioTV choosePreferredNextUpSeed) ───
+  // Source ranking: playback (0) > history (1) > watched_show (2)
+  const seedSourceRank = (source: string): number => {
+    switch (source) {
+      case 'playback': return 0;
+      case 'history': return 1;
+      case 'watched_show': return 2;
+      default: return 4;
+    }
+  };
+
+  const seedsByShow = new Map<string, ProgressEntry[]>();
+  for (const seed of nextUpSeeds) {
+    const existing = seedsByShow.get(seed.contentId) || [];
+    existing.push(seed);
+    seedsByShow.set(seed.contentId, existing);
+  }
+
+  const bestSeeds: ProgressEntry[] = [];
+  for (const [, seeds] of seedsByShow) {
+    const bestRank = Math.min(...seeds.map(s => seedSourceRank(s.source)));
+    const bestRanked = seeds.filter(s => seedSourceRank(s.source) === bestRank);
+    // Among same-rank seeds, pick highest season/episode, then most recent
+    bestRanked.sort((a, b) => {
+      if ((a.season ?? -1) !== (b.season ?? -1)) return (b.season ?? -1) - (a.season ?? -1);
+      if ((a.episode ?? -1) !== (b.episode ?? -1)) return (b.episode ?? -1) - (a.episode ?? -1);
+      return b.lastWatched - a.lastWatched;
+    });
+    if (bestRanked.length > 0) bestSeeds.push(bestRanked[0]);
+  }
+
+  // Sort by lastWatched and limit to CW_MAX_NEXT_UP_LOOKUPS (24)
+  bestSeeds.sort((a, b) => b.lastWatched - a.lastWatched);
+  const topSeeds = bestSeeds.slice(0, CW_MAX_NEXT_UP_LOOKUPS);
+
+  logger.log(`[TraktCW] Up Next seeds: ${nextUpSeeds.length} total → ${bestSeeds.length} deduped → ${topSeeds.length} top seeds`);
+  for (const seed of topSeeds) {
+    logger.log(`[TraktCW]   SEED: ${seed.contentId} S${seed.season}E${seed.episode} src=${seed.source} rank=${seedSourceRank(seed.source)} last=${new Date(seed.lastWatched).toISOString()}`);
+  }
+
+  // ─── 11. Resolve next episodes for each seed ───
+  const localWatchedMap = await localWatchedShowsMapPromise;
+
+  for (const seed of topSeeds) {
+    try {
+      if (!seed.season || !seed.episode) continue;
+
+      const cachedData = await getCachedMetadata('series', seed.contentId);
+      if (!cachedData?.basicContent || !cachedData.metadata?.videos) continue;
+
+      const watchedEpisodeSet = watchedEpisodeSetByShow.get(seed.contentId) ?? new Set<string>();
+      const nextEpisodeResult = findNextEpisode(
+        seed.season,
+        seed.episode,
+        cachedData.metadata.videos,
+        watchedEpisodeSet,
+        seed.contentId,
+        localWatchedMap,
+        seed.lastWatched,
+        true // showUnairedNextUp
+      );
+
+      if (nextEpisodeResult) {
+        const nextEpisode = nextEpisodeResult.video;
+        logger.log(`[TraktCW]   UP-NEXT RESOLVED: ${seed.contentId} seed=S${seed.season}E${seed.episode} → next=S${nextEpisode.season}E${nextEpisode.episode} "${nextEpisode.title || ''}" last=${new Date(seed.lastWatched).toISOString()}`);
+        traktBatch.push({
+          ...cachedData.basicContent,
+          id: seed.contentId,
+          type: 'series',
+          progress: 0,
+          lastUpdated: seed.lastWatched,
+          season: nextEpisode.season,
+          episode: nextEpisode.episode,
+          episodeTitle: nextEpisode.title || `Episode ${nextEpisode.episode}`,
+          addonId: undefined,
+          traktPlaybackId: seed.traktPlaybackId,
+        } as ContinueWatchingItem);
+      } else {
+        logger.log(`[TraktCW]   UP-NEXT DROPPED: ${seed.contentId} seed=S${seed.season}E${seed.episode} — no next episode found (no videos or all watched)`);
+      }
+    } catch (err) {
+      logger.warn(`[TraktCW]   UP-NEXT ERROR: ${seed.contentId}`, err);
+    }
+  }
+
+  // ─── 12. Final dedup, reconcile, and sort ───
+  logger.log(`[TraktCW] Pre-dedup batch: ${traktBatch.length} items (${traktBatch.filter(i => (i.progress ?? 0) > 0).length} in-progress + ${traktBatch.filter(i => (i.progress ?? 0) === 0).length} up-next)`);
+
   if (traktBatch.length === 0) {
+    logger.log('[TraktCW] No items — clearing continue watching list');
     setContinueWatchingItems([]);
     return;
   }
 
+  // Deduplicate: for same content, prefer items with progress > 0 (in-progress over up-next)
   const deduped = new Map<string, ContinueWatchingItem>();
   for (const item of traktBatch) {
     const key = `${item.type}:${item.id}`;
@@ -349,7 +538,6 @@ export async function mergeTraktContinueWatching({
     const existingHasProgress = (existing.progress ?? 0) > 0;
     const candidateHasProgress = (item.progress ?? 0) > 0;
 
-    // CHANGE: Use getValidTime for safe timestamp comparison in dedup logic
     const safeItemTs = getValidTime(item.lastUpdated);
     const safeExistingTs = getValidTime(existing.lastUpdated);
 
@@ -372,8 +560,6 @@ export async function mergeTraktContinueWatching({
 
   const filteredItems = await filterRemovedItems(Array.from(deduped.values()), recentlyRemoved);
   const reconcileLocalPromises: Promise<any>[] = [];
-  // CHANGE: Removed reconcilePromises (Trakt back-sync) — that logic was pushing
-  // local progress back to Trakt which is out of scope for continue watching display.
 
   const adjustedItems = filteredItems
     .map((item) => {
@@ -387,7 +573,7 @@ export async function mergeTraktContinueWatching({
         return item;
       }
 
-      // CHANGE: Use getValidTime for safe timestamp extraction
+      // Use getValidTime for safe timestamp extraction
       const safeLocalTs = getValidTime(mostRecentLocal.lastUpdated);
       const safeItemTs = getValidTime(item.lastUpdated);
 
@@ -456,11 +642,17 @@ export async function mergeTraktContinueWatching({
         }
       }
 
-      // CHANGE: Return safeItemTs (Trakt's paused_at timestamp) instead of
-      // mergedLastUpdated (which took the MAX of local and Trakt timestamps).
-      // The old approach let local storage timestamps corrupt sort order on the
-      // 4-second trailing refresh — a show watched locally months ago would get
-      // a recent local timestamp and jump to the top of the list.
+      // If Trakt says in-progress (2-85%) but local says completed (>=85%),
+      // trust Trakt's playback endpoint — it's authoritative for paused items.
+      const traktIsInProgress = traktProgress >= 2 && traktProgress < 85;
+      const localSaysCompleted = localProgress >= 85;
+      if (traktIsInProgress && localSaysCompleted) {
+        return {
+          ...item,
+          lastUpdated: safeItemTs,
+        };
+      }
+
       if (((isLocalNewer || isLocalRecent) && isDifferent) || isAhead) {
         return {
           ...item,
@@ -473,15 +665,22 @@ export async function mergeTraktContinueWatching({
         ...item,
         lastUpdated: safeItemTs, // keep Trakt timestamp for sort stability
       };
-    })
-    .filter((item) => (item.progress ?? 0) < 85);
+    });
 
-  // CHANGE: Replaced compareContinueWatchingItems (from utils) with an inline
-  // sort using getValidTime so NaN timestamps can't affect order, and all items
-  // (both playback and up next) sort together by recency.
   const finalItems = adjustedItems
     .sort((a, b) => getValidTime(b.lastUpdated) - getValidTime(a.lastUpdated))
-    .slice(0, 30);
+    .slice(0, CW_MAX_DISPLAY_ITEMS);
+
+  logger.log(`[TraktCW] ═══ FINAL LIST: ${finalItems.length} items (capped at ${CW_MAX_DISPLAY_ITEMS}) ═══`);
+  for (let i = 0; i < finalItems.length; i++) {
+    const item = finalItems[i];
+    const isUpNext = (item.progress ?? 0) === 0 && item.type === 'series';
+    const tag = isUpNext ? 'UP-NEXT' : 'RESUME';
+    const epLabel = item.type === 'series' ? ` S${item.season ?? '?'}E${item.episode ?? '?'}` : '';
+    const ts = getValidTime(item.lastUpdated);
+    logger.log(`[TraktCW]   #${i + 1} [${tag}] ${item.name || item.id}${epLabel} — ${item.type} progress=${(item.progress ?? 0).toFixed(1)}% last=${ts ? new Date(ts).toISOString() : 'N/A'}`);
+  }
+  logger.log(`[TraktCW] ═══ END FINAL LIST ═══`);
 
   setContinueWatchingItems(finalItems);
 

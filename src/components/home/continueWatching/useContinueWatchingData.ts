@@ -209,6 +209,8 @@ export function useContinueWatchingData() {
       const simklService = SimklService.getInstance();
       const isSimklAuthed = !isTraktAuthed ? await simklService.isAuthenticated() : false;
 
+      console.log(`[CW-Hook] Auth state: trakt=${isTraktAuthed} simkl=${isSimklAuthed}`);
+
       const traktMoviesSetPromise = getTraktMoviesSet(isTraktAuthed, traktService);
       const traktShowsSetPromise = getTraktShowsSet(isTraktAuthed, traktService);
       const localWatchedShowsMapPromise = getLocalWatchedShowsMap();
@@ -239,7 +241,7 @@ export function useContinueWatchingData() {
 
       await Promise.allSettled([
         isTraktAuthed
-          ? mergeTraktContinueWatching({
+          ? (console.log('[CW-Hook] Calling mergeTraktContinueWatching...'), mergeTraktContinueWatching({
               traktService,
               getCachedMetadata,
               localProgressIndex,
@@ -248,8 +250,8 @@ export function useContinueWatchingData() {
               lastTraktSyncRef,
               lastTraktReconcileRef,
               setContinueWatchingItems,
-            })
-          : Promise.resolve(),
+            }))
+          : (console.log('[CW-Hook] Trakt NOT authed, skipping merge'), Promise.resolve()),
         isSimklAuthed && !isTraktAuthed
           ? mergeSimklContinueWatching({
               simklService,

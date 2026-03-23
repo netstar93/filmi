@@ -3,7 +3,7 @@ class Logger {
 
   constructor() {
     // __DEV__ is a global variable in React Native
-    this.isEnabled = false;
+    this.isEnabled = __DEV__;
   }
 
   log(...args: any[]) {

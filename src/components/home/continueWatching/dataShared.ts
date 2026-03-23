@@ -5,7 +5,7 @@ import { storageService } from '../../../services/storageService';
 import { stremioService } from '../../../services/stremioService';
 import { TraktContentData } from '../../../services/traktService';
 
-import { CACHE_DURATION } from './constants';
+import { CACHE_DURATION, CW_NEXT_UP_NEW_SEASON_UNAIRED_WINDOW_DAYS } from './constants';
 import {
   CachedMetadataEntry,
   GetCachedMetadata,
@@ -133,7 +133,8 @@ export function findNextEpisode(
   watchedSet?: Set<string>,
   showId?: string,
   localWatchedMap?: Map<string, number>,
-  baseTimestamp: number = 0
+  baseTimestamp: number = 0,
+  showUnairedNextUp: boolean = true
 ): { video: any; lastWatched: number } | null {
   if (!videos || !Array.isArray(videos)) return null;
 
@@ -170,12 +171,48 @@ export function findNextEpisode(
     return false;
   };
 
+  const now = new Date();
+  const todayMs = now.getTime();
+
   for (const video of sortedVideos) {
     if (video.season < currentSeason) continue;
     if (video.season === currentSeason && video.episode <= currentEpisode) continue;
     if (isAlreadyWatched(video.season, video.episode)) continue;
 
-    if (isEpisodeReleased(video)) {
+    const isSeasonRollover = video.season !== currentSeason;
+    const releaseDate = video.released ? new Date(video.released) : null;
+    const isValidDate = releaseDate && !isNaN(releaseDate.getTime());
+
+    if (isSeasonRollover) {
+      // Match NuvioTV: for season rollovers, require a valid release date
+      if (!isValidDate) continue;
+
+      if (releaseDate!.getTime() <= todayMs) {
+        // Already aired — include it
+        return { video, lastWatched: latestWatchedTimestamp };
+      }
+
+      if (!showUnairedNextUp) continue;
+
+      // Only show unaired next-season episodes within 7-day window
+      const daysUntil = Math.ceil((releaseDate!.getTime() - todayMs) / (24 * 60 * 60 * 1000));
+      if (daysUntil <= CW_NEXT_UP_NEW_SEASON_UNAIRED_WINDOW_DAYS) {
+        return { video, lastWatched: latestWatchedTimestamp };
+      }
+      continue;
+    }
+
+    // Same season
+    if (isValidDate && releaseDate!.getTime() > todayMs) {
+      // Unaired same-season episode
+      if (showUnairedNextUp) {
+        return { video, lastWatched: latestWatchedTimestamp };
+      }
+      continue;
+    }
+
+    // Aired or no date (same season) — include it
+    if (isEpisodeReleased(video) || !video.released) {
       return { video, lastWatched: latestWatchedTimestamp };
     }
   }
